@@ -55,6 +55,13 @@ app.post("/notify", async (req, res) => {
       `[${chatId}] FCM: ${response.successCount} ok / ${response.failureCount} failed`
     );
 
+    // Логируем детали каждой ошибки
+    response.responses.forEach((resp, idx) => {
+      if (!resp.success) {
+        console.error(`  Token[${idx}] error: ${resp.error?.code} — ${resp.error?.message}`);
+      }
+    });
+
     res.json({
       success: true,
       successCount: response.successCount,
