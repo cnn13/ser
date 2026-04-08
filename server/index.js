@@ -2,7 +2,6 @@ const admin = require("firebase-admin");
 const express = require("express");
 
 // ─── Инициализация Firebase Admin SDK ────────────────────────────────────────
-// SERVICE_ACCOUNT_JSON — содержимое файла serviceAccountKey.json (env-переменная)
 const serviceAccount = JSON.parse(process.env.SERVICE_ACCOUNT_JSON);
 
 admin.initializeApp({
@@ -12,51 +11,58 @@ admin.initializeApp({
 const db = admin.firestore();
 const messaging = admin.messaging();
 
-// ─── Слушаем только новые сообщения (после старта сервера) ───────────────────
-const serverStartTime = Date.now();
-console.log(`Server started at ${new Date(serverStartTime).toISOString()}`);
+// TTL: не отправляем уведомления по задачам старше 5 минут
+// (защита от "взрыва" старых задач после перезапуска сервера)
+const TASK_TTL_MS = 5 * 60 * 1000;
 
-db.collectionGroup("messages")
-  .where("timestamp", ">=", serverStartTime)
-  .onSnapshot(
-    (snapshot) => {
-      snapshot.docChanges().forEach(async (change) => {
-        if (change.type !== "added") return;
+console.log("Server started, listening to notification_tasks...");
 
-        try {
-          await handleNewMessage(change.doc);
-        } catch (err) {
-          console.error("Error handling message:", err);
-        }
-      });
-    },
-    (err) => {
-      console.error("Firestore listener error:", err);
-      // Render перезапустит процесс если он упадёт
-      process.exit(1);
+// ─── Слушаем коллекцию notification_tasks ────────────────────────────────────
+// Не требует индексов и не упирается в security rules (Admin SDK их обходит)
+db.collection("notification_tasks").onSnapshot(
+  async (snapshot) => {
+    for (const change of snapshot.docChanges()) {
+      if (change.type !== "added") continue;
+
+      const ref = change.doc.ref;
+      const task = change.doc.data();
+
+      // Удаляем устаревшую задачу молча
+      if (Date.now() - (task.timestamp ?? 0) > TASK_TTL_MS) {
+        await ref.delete().catch(() => {});
+        continue;
+      }
+
+      try {
+        await processTask(task);
+      } catch (err) {
+        console.error("Error processing task:", err?.message ?? err);
+      } finally {
+        // Всегда удаляем задачу — чтобы не обработать повторно
+        await ref.delete().catch(() => {});
+      }
     }
-  );
+  },
+  (err) => {
+    console.error("Firestore listener error:", err?.message ?? err);
+    process.exit(1); // Render перезапустит процесс
+  }
+);
 
-async function handleNewMessage(doc) {
-  const msg = doc.data();
-  const chatId = doc.ref.parent.parent.id;
-  const senderId = msg.senderId;
+async function processTask(task) {
+  const { senderId, senderEmail, chatId, text, contentType } = task;
 
   if (!senderId || !chatId) return;
 
   // Текст уведомления
   const bodyText =
-    msg.contentType === "image"
+    contentType === "image"
       ? "📷 Изображение"
-      : msg.contentType === "file"
+      : contentType === "file"
       ? "📎 Файл"
-      : msg.text || "";
+      : text ?? "";
 
   if (!bodyText) return;
-
-  // Имя отправителя
-  const senderSnap = await db.collection("users").doc(senderId).get();
-  const senderName = senderSnap.data()?.email ?? "Новое сообщение";
 
   // Участники чата
   const chatSnap = await db.collection("chats").doc(chatId).get();
@@ -76,14 +82,17 @@ async function handleNewMessage(doc) {
     .filter((t) => typeof t === "string" && t.length > 0);
 
   if (tokens.length === 0) {
-    console.log(`No tokens for chat ${chatId}, skipping`);
+    console.log(`No FCM tokens for chat ${chatId}`);
     return;
   }
 
   // Отправляем FCM
   const response = await messaging.sendEachForMulticast({
     tokens,
-    notification: { title: senderName, body: bodyText },
+    notification: {
+      title: senderEmail ?? "Новое сообщение",
+      body: bodyText,
+    },
     data: { chatId },
     android: {
       priority: "high",
@@ -96,37 +105,37 @@ async function handleNewMessage(doc) {
   });
 
   console.log(
-    `[${chatId}] Sent ${response.successCount}/${tokens.length} notifications`
+    `[${chatId}] Notifications: ${response.successCount} ok / ${response.failureCount} failed`
   );
 
   // Удаляем невалидные токены из Firestore
-  const invalidCodes = [
+  const invalidCodes = new Set([
     "messaging/invalid-registration-token",
     "messaging/registration-token-not-registered",
-  ];
+  ]);
+
   const batch = db.batch();
-  let hasBadTokens = false;
+  let hasBad = false;
 
   response.responses.forEach((resp, idx) => {
-    if (!resp.success && invalidCodes.includes(resp.error?.code)) {
-      const badToken = tokens[idx];
-      const snap = userSnaps.find((s) => s.data()?.fcmToken === badToken);
-      if (snap) {
+    if (!resp.success && invalidCodes.has(resp.error?.code)) {
+      const snap = userSnaps.find((s) => s.data()?.fcmToken === tokens[idx]);
+      if (snap?.ref) {
         batch.update(snap.ref, { fcmToken: admin.firestore.FieldValue.delete() });
-        hasBadTokens = true;
+        hasBad = true;
       }
     }
   });
 
-  if (hasBadTokens) await batch.commit();
+  if (hasBad) await batch.commit();
 }
 
-// ─── HTTP-сервер (нужен для Render — проверяет живость через GET /) ───────────
+// ─── HTTP-сервер (Render требует открытый порт) ───────────────────────────────
 const app = express();
 
-app.get("/", (_req, res) => {
-  res.send("CoolMessanger notification server is running ✓");
-});
+app.get("/", (_req, res) =>
+  res.send("CoolMessanger notification server is running ✓")
+);
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`HTTP server listening on port ${PORT}`));
+app.listen(PORT, () => console.log(`HTTP listening on port ${PORT}`));
